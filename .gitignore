@@ -1,0 +1,5 @@
+library.db
+failed_downloads.log
+venv
+.env
+.spotify_cache
