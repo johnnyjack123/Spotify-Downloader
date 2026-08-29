@@ -8,20 +8,11 @@ YouTube Music's curated official "songs" catalog via ytmusicapi and scores
 candidates by title/artist similarity plus duration match against the real
 Spotify runtime. Low-confidence matches are flagged in issues.log.
 
-Album Artist vs Track Artist: Navidrome groups albums primarily by the
-"Album Artist" tag, not by folder structure. A featuring track (e.g.
-"Spaceman" by "Electric Callboy, FiNCH") has a different track-level Artist
-string than the rest of the album, which used to split it into a separate
-album folder AND a separate Navidrome album grouping. This is fixed by
-using Spotify's album-level artist credit (which excludes track-only
-features) for both the folder path and a dedicated TPE2/"albumartist" tag,
-while the track-level Artist tag keeps full featuring credits.
-
-Automatic reorganization: tracks already in library.db are checked against
-where they *should* live under the new album-artist-based folder scheme.
-If a file is in the wrong place, it's moved (with its .lrc sidecar) to the
-correct location, the DB entry is updated, and now-empty old folders are
-cleaned up -- no re-download needed.
+Album Artist vs Track Artist: folder placement and the TPE2/"albumartist"
+tag both use Spotify's album-level artist credit (excludes track-only
+features), so Navidrome groups albums correctly even when individual
+tracks have different featuring artists. Already-downloaded tracks are
+automatically moved/retagged to match on every run.
 
 Manual overrides ("hosts file" for songs): add a line to
 <OUTPUT_DIR>/overrides.txt:
@@ -36,10 +27,18 @@ Genre lookup: via MusicBrainz (ISRC -> recording -> genres/tags), respecting
 their 1 req/sec rate limit and required User-Agent. A "genre lookup done"
 marker avoids repeat queries for songs with no genre data there.
 
+Auto-starring: ONLY when the run's source is "Liked Songs" does the script
+star every track of the current run on Navidrome at the end, in Spotify
+"added_at" order (oldest first), so Navidrome's dateLoved timestamps end up
+in the same relative order. Playlists and albums are never auto-starred --
+use star_favorites.py separately if you want that for arbitrary folders.
+Needs NAVIDROME_URL/USER/PASS in the .env; silently skipped (with a log
+message) if those aren't set.
+
 Modes:
   python spotify_to_feishin.py                            # PLAYLIST_NAME from .env
   python spotify_to_feishin.py --playlist "Roadtrip Mix"
-  python spotify_to_feishin.py --playlist "Liked Songs"
+  python spotify_to_feishin.py --playlist "Liked Songs"    # auto-stars at the end
   python spotify_to_feishin.py --album "Album Name"
   python spotify_to_feishin.py --album <spotify_album_url_or_uri>
   python spotify_to_feishin.py --playlist "Liked Songs" --use-overrides
@@ -54,6 +53,7 @@ import time
 import base64
 import shutil
 import sqlite3
+import hashlib
 import logging
 import argparse
 from difflib import SequenceMatcher
@@ -101,6 +101,12 @@ if OUTPUT_FORMAT not in ("mp3", "opus"):
     log.warning(f"Unbekanntes OUTPUT_FORMAT '{OUTPUT_FORMAT}', falle zurück auf mp3.")
     OUTPUT_FORMAT = "mp3"
 
+NAVIDROME_URL = os.getenv("NAVIDROME_URL", "").strip().rstrip("/")
+NAVIDROME_USER = os.getenv("NAVIDROME_USER", "").strip()
+NAVIDROME_PASS = os.getenv("NAVIDROME_PASS", "").strip()
+SUBSONIC_CLIENT = "spotify-to-feishin"
+SUBSONIC_VERSION = "1.16.1"
+
 LRCLIB_ENDPOINT = "https://lrclib.net/api/get"
 YT_MUSIC_SEARCH_LIMIT = 8
 MATCH_CONFIDENCE_WARN_THRESHOLD = 0.6
@@ -111,6 +117,7 @@ MUSICBRAINZ_USER_AGENT = "SpotifyToNavidromePipeline/1.0 ( personal homelab scri
 _mb_last_call = 0.0
 
 LIKED_SONGS_ALIASES = {"liked songs", "lieblingssongs", "your library", "meine musik"}
+LIKED_SONGS_SOURCE_LABEL = "Liked Songs"
 
 DB_PATH_NAME = "library.db"
 ISSUES_LOG_NAME = "issues.log"
@@ -250,7 +257,6 @@ def fetch_musicbrainz_genres(isrc: str) -> list[str]:
         if not recordings:
             return []
         mbid = recordings[0]["id"]
-
         _mb_rate_limit()
         r2 = requests.get(f"{MUSICBRAINZ_BASE}/recording/{mbid}",
                            params={"fmt": "json", "inc": "genres+tags"}, headers=headers, timeout=10)
@@ -271,6 +277,69 @@ def fetch_musicbrainz_genres(isrc: str) -> list[str]:
 def get_genres_for_track(track: dict) -> list[str]:
     isrc = track.get("isrc")
     return fetch_musicbrainz_genres(isrc) if isrc else []
+
+
+# ---------------------------------------------------------------------------
+# Navidrome starring (automatic, only for Liked Songs runs)
+# ---------------------------------------------------------------------------
+
+def _navidrome_auth_params() -> dict:
+    salt = hashlib.md5(os.urandom(8)).hexdigest()
+    token = hashlib.md5((NAVIDROME_PASS + salt).encode()).hexdigest()
+    return {"u": NAVIDROME_USER, "t": token, "s": salt, "v": SUBSONIC_VERSION, "c": SUBSONIC_CLIENT, "f": "json"}
+
+
+def _navidrome_find_song_id(title: str, artist: str) -> str | None:
+    params = _navidrome_auth_params()
+    params["query"] = title
+    try:
+        r = requests.get(f"{NAVIDROME_URL}/rest/search3", params=params, timeout=15)
+        r.raise_for_status()
+        songs = r.json().get("subsonic-response", {}).get("searchResult3", {}).get("song", [])
+    except (requests.RequestException, ValueError):
+        return None
+    for s in songs:
+        if s.get("title") == title and s.get("artist") == artist:
+            return s["id"]
+    title_matches = [s for s in songs if s.get("title") == title]
+    return title_matches[0]["id"] if len(title_matches) == 1 else None
+
+
+def _navidrome_star(song_id: str) -> bool:
+    params = _navidrome_auth_params()
+    params["id"] = song_id
+    try:
+        r = requests.get(f"{NAVIDROME_URL}/rest/star", params=params, timeout=15)
+        r.raise_for_status()
+        return "error" not in r.json().get("subsonic-response", {})
+    except (requests.RequestException, ValueError):
+        return False
+
+
+def star_liked_songs_in_order(tracks: list[dict]):
+    if not (NAVIDROME_URL and NAVIDROME_USER and NAVIDROME_PASS):
+        log.warning("Liked Songs wurden geladen, aber NAVIDROME_URL/USER/PASS fehlen in der .env -- Starring übersprungen.")
+        return
+
+    def sort_key(t):
+        ts = parse_spotify_timestamp(t.get("added_at"))
+        return ts if ts is not None else 0
+
+    ordered = sorted([t for t in tracks if t["title"].strip() and t["artist"].strip()], key=sort_key)
+
+    starred, not_found, failed = 0, 0, 0
+    for track in tqdm(ordered, desc="Starre Liked Songs (Spotify-Reihenfolge)", unit="song"):
+        song_id = _navidrome_find_song_id(track["title"], track["artist"])
+        if not song_id:
+            not_found += 1
+            continue
+        if _navidrome_star(song_id):
+            starred += 1
+        else:
+            failed += 1
+        time.sleep(0.05)  # keeps dateLoved timestamps strictly increasing in the right order
+
+    log.info(f"Starring abgeschlossen: {starred} markiert, {not_found} nicht gefunden, {failed} fehlgeschlagen.")
 
 
 # ---------------------------------------------------------------------------
@@ -488,7 +557,7 @@ def load_tracks(sp: spotipy.Spotify, name: str, is_album: bool) -> tuple[list[di
         return get_album_tracks(sp, album_id), f"Album: {album_name}"
     if name.lower() in LIKED_SONGS_ALIASES:
         log.info("Lade 'Liked Songs' (dein Spotify-Herz-Feed), nicht als normale Playlist abrufbar sonst.")
-        return get_liked_songs(sp), "Liked Songs"
+        return get_liked_songs(sp), LIKED_SONGS_SOURCE_LABEL
     playlist_id = find_playlist_id_by_name(sp, name)
     log.info(f"Playlist '{name}' gefunden, lade Tracks...")
     return get_playlist_tracks(sp, playlist_id), f"Playlist: {name}"
@@ -736,16 +805,13 @@ def handle_lyrics(track: dict, dest_path: Path) -> str | None:
 # ---------------------------------------------------------------------------
 
 def reorganize_if_needed(conn: sqlite3.Connection, track: dict, existing_row: sqlite3.Row) -> Path:
-    """Moves a file to where it *should* live under the album-artist-based
-    folder scheme, if it currently lives elsewhere (e.g. downloaded before
-    this fix, or under a track-artist folder due to a featuring credit)."""
     old_path = Path(existing_row["file_path"])
     new_path = compute_dest_path(track)
 
     if old_path == new_path:
         return old_path
     if not old_path.exists():
-        return old_path  # nothing to move; will be flagged as missing elsewhere
+        return old_path
 
     new_path.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -764,15 +830,14 @@ def reorganize_if_needed(conn: sqlite3.Connection, track: dict, existing_row: sq
     update_file_path(conn, track["spotify_id"], new_path)
     log.info(f"Song neu einsortiert (Album-Artist-Korrektur): {old_path} -> {new_path}")
 
-    old_album_dir, old_artist_dir = old_path.parent, old_path.parent.parent
-    _remove_if_empty(old_album_dir)
-    _remove_if_empty(old_artist_dir)
+    _remove_if_empty(old_path.parent)
+    _remove_if_empty(old_path.parent.parent)
 
     return new_path
 
 
 # ---------------------------------------------------------------------------
-# Metadata completeness check / backfill for already-downloaded tracks
+# Metadata completeness check / backfill
 # ---------------------------------------------------------------------------
 
 def read_existing_tag_values(path: Path, fmt: str) -> dict:
@@ -949,6 +1014,9 @@ def main():
               f"(davon {backfilled} mit Metadaten-Backfill, {moved} neu einsortiert), "
               f"fehlgeschlagen: {failed}, ungültige Metadaten: {invalid} "
               f"(Details in {OUTPUT_DIR / ISSUES_LOG_NAME}).")
+
+    if source_label == LIKED_SONGS_SOURCE_LABEL:
+        star_liked_songs_in_order(tracks)
 
 
 if __name__ == "__main__":
