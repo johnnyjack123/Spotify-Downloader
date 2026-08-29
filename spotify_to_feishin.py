@@ -3,21 +3,38 @@
 Spotify -> YouTube Music (via ytmusicapi) -> local music library ("Repo") pipeline.
 
 NOTE on song matching: Odesli/song.link's public API was retired by Linktree
-on 2026-08-01, so it can't be used for automated cross-platform lookups
-anymore (the landing pages still work for manual, one-off use though --
-paste the Spotify link stored in each file's tags into https://song.link
-yourself anytime). Instead of a raw YouTube text search, this script
-searches YouTube Music's curated official "songs" catalog via ytmusicapi
-and scores candidates by title/artist similarity plus duration match
-against the real Spotify runtime. Low-confidence matches are flagged in
-issues.log so you can spot-check them.
+on 2026-08-01. Instead of a raw YouTube text search, this script searches
+YouTube Music's curated official "songs" catalog via ytmusicapi and scores
+candidates by title/artist similarity plus duration match against the real
+Spotify runtime. Low-confidence matches are flagged in issues.log.
 
-Manual overrides ("hosts file" for songs): if a track can't be resolved
-automatically (or you just prefer a specific video), add a line to
+Album Artist vs Track Artist: Navidrome groups albums primarily by the
+"Album Artist" tag, not by folder structure. A featuring track (e.g.
+"Spaceman" by "Electric Callboy, FiNCH") has a different track-level Artist
+string than the rest of the album, which used to split it into a separate
+album folder AND a separate Navidrome album grouping. This is fixed by
+using Spotify's album-level artist credit (which excludes track-only
+features) for both the folder path and a dedicated TPE2/"albumartist" tag,
+while the track-level Artist tag keeps full featuring credits.
+
+Automatic reorganization: tracks already in library.db are checked against
+where they *should* live under the new album-artist-based folder scheme.
+If a file is in the wrong place, it's moved (with its .lrc sidecar) to the
+correct location, the DB entry is updated, and now-empty old folders are
+cleaned up -- no re-download needed.
+
+Manual overrides ("hosts file" for songs): add a line to
 <OUTPUT_DIR>/overrides.txt:
     <spotify_track_url_or_uri>    <youtube_url>
-and run with --use-overrides. Metadata (title/artist/album/cover/ISRC)
-always comes from Spotify regardless -- only the audio source changes.
+and run with --use-overrides.
+
+Metadata backfill: title/artist/album/albumartist/tracknumber/isrc/date/
+genre are checked on every already-downloaded track and rewritten in place
+if missing, without re-downloading or re-matching.
+
+Genre lookup: via MusicBrainz (ISRC -> recording -> genres/tags), respecting
+their 1 req/sec rate limit and required User-Agent. A "genre lookup done"
+marker avoids repeat queries for songs with no genre data there.
 
 Modes:
   python spotify_to_feishin.py                            # PLAYLIST_NAME from .env
@@ -26,14 +43,6 @@ Modes:
   python spotify_to_feishin.py --album "Album Name"
   python spotify_to_feishin.py --album <spotify_album_url_or_uri>
   python spotify_to_feishin.py --playlist "Liked Songs" --use-overrides
-  python spotify_to_feishin.py --playlist "Liked Songs" --use-overrides custom_overrides.txt
-
-Headless / SSH-only machines (e.g. a Raspberry Pi):
-  The Spotify OAuth login does NOT try to auto-open a browser on this
-  machine (open_browser=False). It prints the login URL to the console --
-  open that URL in a browser on ANY device, log in, then paste the
-  resulting redirect URL back into this terminal when prompted. A
-  .spotify_cache file is created afterwards so future runs skip the login.
 
 Setup: see README.md / requirements.txt
 """
@@ -43,6 +52,7 @@ import re
 import sys
 import time
 import base64
+import shutil
 import sqlite3
 import logging
 import argparse
@@ -55,7 +65,7 @@ import spotipy
 from spotipy.oauth2 import SpotifyOAuth
 from spotipy.exceptions import SpotifyException
 from dotenv import load_dotenv
-from mutagen.id3 import ID3, TIT2, TPE1, TALB, TRCK, APIC, TXXX, TSRC, USLT
+from mutagen.id3 import ID3, TIT2, TPE1, TPE2, TALB, TRCK, TDRC, TCON, APIC, TXXX, TSRC, USLT
 from mutagen.mp3 import MP3
 from mutagen.oggopus import OggOpus
 from mutagen.flac import Picture
@@ -63,8 +73,21 @@ from tqdm import tqdm
 from ytmusicapi import YTMusic
 import yt_dlp
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+
+class TqdmLoggingHandler(logging.Handler):
+    def emit(self, record):
+        try:
+            tqdm.write(self.format(record))
+        except Exception:
+            self.handleError(record)
+
+
 log = logging.getLogger("spotify2repo")
+log.setLevel(logging.INFO)
+log.propagate = False
+_console_handler = TqdmLoggingHandler()
+_console_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+log.addHandler(_console_handler)
 
 load_dotenv()
 
@@ -80,7 +103,12 @@ if OUTPUT_FORMAT not in ("mp3", "opus"):
 
 LRCLIB_ENDPOINT = "https://lrclib.net/api/get"
 YT_MUSIC_SEARCH_LIMIT = 8
-MATCH_CONFIDENCE_WARN_THRESHOLD = 0.6  # below this, flag the match as uncertain
+MATCH_CONFIDENCE_WARN_THRESHOLD = 0.6
+
+MUSICBRAINZ_BASE = "https://musicbrainz.org/ws/2"
+MUSICBRAINZ_MIN_INTERVAL = 1.1
+MUSICBRAINZ_USER_AGENT = "SpotifyToNavidromePipeline/1.0 ( personal homelab script, no public contact )"
+_mb_last_call = 0.0
 
 LIKED_SONGS_ALIASES = {"liked songs", "lieblingssongs", "your library", "meine musik"}
 
@@ -91,7 +119,7 @@ OVERRIDES_FILE_NAME = "overrides.txt"
 SPOTIFY_ALBUM_ID_RE = re.compile(r"(?:spotify\.com/album/|spotify:album:)([a-zA-Z0-9]+)")
 SPOTIFY_TRACK_ID_RE = re.compile(r"(?:spotify\.com/track/|spotify:track:)([a-zA-Z0-9]+)")
 
-ytmusic = YTMusic()  # unauthenticated public catalog search is sufficient here
+ytmusic = YTMusic()
 
 issues_logger = logging.getLogger("issues")
 issues_logger.setLevel(logging.INFO)
@@ -106,7 +134,10 @@ def setup_issues_logger(output_dir: Path):
 
 
 def log_issue(track: dict, category: str, detail: str):
-    issues_logger.info(f"[{category}] {track['artist']} - {track['title']} | {track['spotify_url']} | {detail}")
+    artist = track.get("artist") or "(unbekannt)"
+    title = track.get("title") or "(unbekannt)"
+    spotify_url = track.get("spotify_url") or f"spotify_id={track.get('spotify_id', '?')}"
+    issues_logger.info(f"[{category}] {artist} - {title} | {spotify_url} | {detail}")
 
 
 def sanitize(name: str) -> str:
@@ -130,8 +161,7 @@ def parse_args():
     group.add_argument("--album", metavar="NAME_OR_URL", help="Albumname oder Spotify-Album-Link/URI.")
     parser.add_argument(
         "--use-overrides", nargs="?", const="__default__", default=None, metavar="PATH",
-        help=f"Nutzt eine Override-Datei (Spotify-Link -> YouTube-Link). "
-             f"Ohne Pfad wird <OUTPUT_DIR>/{OVERRIDES_FILE_NAME} verwendet.",
+        help=f"Nutzt eine Override-Datei. Ohne Pfad wird <OUTPUT_DIR>/{OVERRIDES_FILE_NAME} verwendet.",
     )
     args = parser.parse_args()
 
@@ -153,32 +183,94 @@ def parse_args():
 
 
 # ---------------------------------------------------------------------------
-# Manual overrides ("hosts file" for songs)
+# Manual overrides
 # ---------------------------------------------------------------------------
 
 def load_overrides(path: Path) -> dict[str, str]:
     if not path.exists():
         log.warning(f"Override-Datei nicht gefunden: {path} -- wird ignoriert.")
         return {}
-
     overrides = {}
     for line_no, raw_line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
+        line = raw_line.split("#", 1)[0].strip()
+        if not line:
             continue
         parts = line.split()
         if len(parts) < 2:
             log.warning(f"Override-Datei {path}, Zeile {line_no}: ungültiges Format, übersprungen.")
             continue
-        spotify_part, youtube_url = parts[0], parts[1]
-        m = SPOTIFY_TRACK_ID_RE.search(spotify_part)
+        m = SPOTIFY_TRACK_ID_RE.search(parts[0])
         if not m:
             log.warning(f"Override-Datei {path}, Zeile {line_no}: keine gültige Spotify-Track-ID/URL erkannt.")
             continue
-        overrides[m.group(1)] = youtube_url
-
+        overrides[m.group(1)] = parts[1]
     log.info(f"{len(overrides)} Override(s) aus {path} geladen.")
     return overrides
+
+
+def remove_existing_files(dest_path: Path):
+    for suffix in (dest_path.suffix, ".lrc"):
+        p = dest_path.with_suffix(suffix)
+        if p.exists():
+            try:
+                p.unlink()
+            except OSError as e:
+                log.warning(f"Konnte alte Datei nicht löschen ({p}): {e}")
+
+
+def _remove_if_empty(directory: Path):
+    try:
+        if directory.is_dir() and not any(directory.iterdir()):
+            directory.rmdir()
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# MusicBrainz genre lookup
+# ---------------------------------------------------------------------------
+
+def _mb_rate_limit():
+    global _mb_last_call
+    elapsed = time.monotonic() - _mb_last_call
+    if elapsed < MUSICBRAINZ_MIN_INTERVAL:
+        time.sleep(MUSICBRAINZ_MIN_INTERVAL - elapsed)
+    _mb_last_call = time.monotonic()
+
+
+def fetch_musicbrainz_genres(isrc: str) -> list[str]:
+    headers = {"User-Agent": MUSICBRAINZ_USER_AGENT}
+    try:
+        _mb_rate_limit()
+        r = requests.get(f"{MUSICBRAINZ_BASE}/isrc/{isrc}",
+                          params={"fmt": "json", "inc": "releases"}, headers=headers, timeout=10)
+        if r.status_code != 200:
+            return []
+        recordings = r.json().get("recordings", [])
+        if not recordings:
+            return []
+        mbid = recordings[0]["id"]
+
+        _mb_rate_limit()
+        r2 = requests.get(f"{MUSICBRAINZ_BASE}/recording/{mbid}",
+                           params={"fmt": "json", "inc": "genres+tags"}, headers=headers, timeout=10)
+        if r2.status_code != 200:
+            return []
+        data = r2.json()
+        genres = [g["name"] for g in data.get("genres", [])]
+        tags = [t["name"] for t in sorted(data.get("tags", []), key=lambda t: -(t.get("count") or 0))]
+        combined = []
+        for name in genres + tags:
+            if name and name not in combined:
+                combined.append(name)
+        return combined[:3]
+    except (requests.RequestException, ValueError, KeyError):
+        return []
+
+
+def get_genres_for_track(track: dict) -> list[str]:
+    isrc = track.get("isrc")
+    return fetch_musicbrainz_genres(isrc) if isrc else []
 
 
 # ---------------------------------------------------------------------------
@@ -198,13 +290,17 @@ def init_db(output_dir: Path) -> sqlite3.Connection:
             track_number INTEGER,
             spotify_url TEXT,
             youtube_url TEXT,
-            resolved_via TEXT,
             file_path TEXT NOT NULL,
             source TEXT,
             added_at TEXT,
             downloaded_at TEXT NOT NULL
         )
     """)
+    existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(tracks)")}
+    for col, coltype in {"resolved_via": "TEXT"}.items():
+        if col not in existing_cols:
+            conn.execute(f"ALTER TABLE tracks ADD COLUMN {col} {coltype}")
+            log.info(f"Datenbankschema aktualisiert: Spalte '{col}' zu 'tracks' hinzugefügt.")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_isrc ON tracks(isrc)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_album ON tracks(artist, album)")
     conn.commit()
@@ -221,6 +317,11 @@ def already_in_repo(conn: sqlite3.Connection, spotify_id: str, isrc: str | None)
         if row:
             return row
     return None
+
+
+def update_file_path(conn: sqlite3.Connection, spotify_id: str, new_path: Path):
+    conn.execute("UPDATE tracks SET file_path = ? WHERE spotify_id = ?", (str(new_path), spotify_id))
+    conn.commit()
 
 
 def record_track(conn: sqlite3.Connection, track: dict, file_path: Path, youtube_url: str, resolved_via: str, source: str):
@@ -245,12 +346,9 @@ def get_spotify_client() -> spotipy.Spotify:
         log.error("SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET fehlen in der .env-Datei.")
         sys.exit(1)
     auth_manager = SpotifyOAuth(
-        client_id=CLIENT_ID,
-        client_secret=CLIENT_SECRET,
-        redirect_uri=REDIRECT_URI,
+        client_id=CLIENT_ID, client_secret=CLIENT_SECRET, redirect_uri=REDIRECT_URI,
         scope="playlist-read-private playlist-read-collaborative user-library-read",
-        cache_path=".spotify_cache",
-        open_browser=False,  # headless-friendly: prints the login URL instead of opening a browser
+        cache_path=".spotify_cache", open_browser=False,
     )
     return spotipy.Spotify(auth_manager=auth_manager)
 
@@ -275,25 +373,31 @@ def find_playlist_id_by_name(sp: spotipy.Spotify, name: str) -> str:
 def _track_dict(t: dict, added_at: str | None) -> dict | None:
     if not t or t.get("is_local") or not t.get("external_urls"):
         return None
-    images = (t.get("album") or {}).get("images") or []
+    album = t.get("album") or {}
+    images = album.get("images") or []
+    album_artists = album.get("artists") or []
+    track_artist = ", ".join(a["name"] for a in (t.get("artists") or []))
+    album_artist = ", ".join(a["name"] for a in album_artists) if album_artists else track_artist
     return {
         "spotify_id": t["id"],
         "isrc": (t.get("external_ids") or {}).get("isrc"),
-        "title": t["name"],
-        "artist": ", ".join(a["name"] for a in t["artists"]),
-        "album": t["album"]["name"],
+        "title": t.get("name") or "",
+        "artist": track_artist,
+        "album_artist": album_artist,
+        "album": album.get("name") or "",
         "track_number": t.get("track_number") or 0,
         "spotify_url": t["external_urls"]["spotify"],
         "cover_url": images[0]["url"] if images else None,
         "duration_s": round((t.get("duration_ms") or 0) / 1000),
         "added_at": added_at,
+        "release_date": album.get("release_date") or "",
     }
 
 
 def get_playlist_tracks(sp: spotipy.Spotify, playlist_id: str) -> list[dict]:
     tracks, offset = [], 0
     fields = ("items(added_at,track(id,name,track_number,duration_ms,external_ids,external_urls,"
-              "is_local,artists(name),album(name,images))),next")
+              "is_local,artists(name),album(name,images,release_date,artists(name)))),next")
     while True:
         page = sp.playlist_items(playlist_id, fields=fields, offset=offset, limit=100)
         for item in page["items"]:
@@ -339,6 +443,8 @@ def resolve_album_id(sp: spotipy.Spotify, name_or_url: str) -> tuple[str, str]:
 def get_album_tracks(sp: spotipy.Spotify, album_id: str) -> list[dict]:
     album = sp.album(album_id)
     album_name = album["name"]
+    release_date = album.get("release_date") or ""
+    album_artist = ", ".join(a["name"] for a in (album.get("artists") or []))
     images = album.get("images") or []
     cover_url = images[0]["url"] if images else None
 
@@ -361,14 +467,16 @@ def get_album_tracks(sp: spotipy.Spotify, album_id: str) -> list[dict]:
             tracks.append({
                 "spotify_id": t["id"],
                 "isrc": (t.get("external_ids") or {}).get("isrc"),
-                "title": t["name"],
-                "artist": ", ".join(a["name"] for a in t["artists"]),
+                "title": t.get("name") or "",
+                "artist": ", ".join(a["name"] for a in (t.get("artists") or [])),
+                "album_artist": album_artist,
                 "album": album_name,
                 "track_number": t.get("track_number") or 0,
                 "spotify_url": t["external_urls"]["spotify"],
                 "cover_url": cover_url,
                 "duration_s": round((t.get("duration_ms") or 0) / 1000),
-                "added_at": None,  # albums have no personal "added_at"
+                "added_at": None,
+                "release_date": release_date,
             })
     return tracks
 
@@ -386,8 +494,16 @@ def load_tracks(sp: spotipy.Spotify, name: str, is_album: bool) -> tuple[list[di
     return get_playlist_tracks(sp, playlist_id), f"Playlist: {name}"
 
 
+def compute_dest_path(track: dict) -> Path:
+    artist_dir = OUTPUT_DIR / sanitize(track["album_artist"])
+    album_dir = artist_dir / sanitize(track["album"])
+    base_name = (f"{track['track_number']:02d} - {sanitize(track['title'])}"
+                 if track["track_number"] else sanitize(track["title"]))
+    return album_dir / f"{base_name}.{OUTPUT_FORMAT}"
+
+
 # ---------------------------------------------------------------------------
-# YouTube Music resolution via ytmusicapi (replaces the retired Odesli API)
+# YouTube Music resolution via ytmusicapi
 # ---------------------------------------------------------------------------
 
 def _similarity(a: str, b: str) -> float:
@@ -399,43 +515,35 @@ def _score_candidate(result: dict, track: dict) -> float:
     artist_names = ", ".join(a.get("name", "") for a in (result.get("artists") or []))
     primary_artist = track["artist"].split(",")[0].strip()
     artist_sim = _similarity(artist_names, primary_artist) if artist_names else 0.0
-
     target_duration = track.get("duration_s")
     result_duration = result.get("duration_seconds")
     if target_duration and result_duration:
         duration_score = max(0.0, 1 - abs(result_duration - target_duration) / max(target_duration, 1))
     else:
-        duration_score = 0.5  # neutral if we can't compare
-
+        duration_score = 0.5
     return 0.4 * title_sim + 0.3 * artist_sim + 0.3 * duration_score
 
 
 def search_youtube_music(track: dict) -> tuple[str | None, float]:
-    """Returns (music.youtube.com URL, confidence score 0..1)."""
     query = f"{track['artist']} {track['title']}"
     results = []
     try:
         results = ytmusic.search(query, filter="songs", limit=YT_MUSIC_SEARCH_LIMIT) or []
     except Exception as e:
         log.warning(f"YT-Music-Suche (songs) fehlgeschlagen für '{query}': {e}")
-
     if not results:
         try:
             results = ytmusic.search(query, filter="videos", limit=YT_MUSIC_SEARCH_LIMIT) or []
         except Exception as e:
             log.error(f"YT-Music-Suche (videos) fehlgeschlagen für '{query}': {e}")
-
     candidates = [(r, _score_candidate(r, track)) for r in results if r.get("videoId")]
     if not candidates:
         return None, 0.0
-
     best, best_score = max(candidates, key=lambda c: c[1])
     return f"https://music.youtube.com/watch?v={best['videoId']}", best_score
 
 
 def resolve_youtube_url(track: dict, overrides: dict[str, str]) -> tuple[str | None, float, str]:
-    """Returns (youtube_url, confidence, resolved_via) where resolved_via
-    is 'override' or 'search'."""
     override_url = overrides.get(track["spotify_id"])
     if override_url:
         return override_url, 1.0, "override"
@@ -448,7 +556,6 @@ def resolve_youtube_url(track: dict, overrides: dict[str, str]) -> tuple[str | N
 # ---------------------------------------------------------------------------
 
 def fetch_lyrics(track: dict) -> tuple[str | None, str | None]:
-    """Returns (synced_lrc_text, plain_text). Either can be None."""
     params = {
         "track_name": track["title"],
         "artist_name": track["artist"].split(",")[0].strip(),
@@ -477,8 +584,7 @@ def download_audio(youtube_url: str, dest_path: Path, fmt: str) -> bool:
         "format": "bestaudio/best",
         "outtmpl": tmp_template + ".%(ext)s",
         "postprocessors": [{
-            "key": "FFmpegExtractAudio",
-            "preferredcodec": fmt,
+            "key": "FFmpegExtractAudio", "preferredcodec": fmt,
             "preferredquality": "192" if fmt == "mp3" else "128",
         }],
         "quiet": True, "no_warnings": True, "noprogress": True,
@@ -519,7 +625,8 @@ def _download_cover_bytes(cover_url: str | None) -> bytes | None:
         return None
 
 
-def tag_mp3(path: Path, track: dict, plain_lyrics: str | None):
+def tag_mp3(path: Path, track: dict, plain_lyrics: str | None, embed_cover: bool = True,
+            genres: list[str] | None = None, mark_genre_checked: bool = False):
     audio = MP3(path, ID3=ID3)
     try:
         audio.add_tags()
@@ -528,57 +635,75 @@ def tag_mp3(path: Path, track: dict, plain_lyrics: str | None):
 
     audio.tags.setall("TIT2", [TIT2(encoding=3, text=track["title"])])
     audio.tags.setall("TPE1", [TPE1(encoding=3, text=track["artist"])])
+    audio.tags.setall("TPE2", [TPE2(encoding=3, text=track.get("album_artist") or track["artist"])])
     audio.tags.setall("TALB", [TALB(encoding=3, text=track["album"])])
     if track["track_number"]:
         audio.tags.setall("TRCK", [TRCK(encoding=3, text=str(track["track_number"]))])
     if track.get("isrc"):
         audio.tags.setall("TSRC", [TSRC(encoding=3, text=track["isrc"])])
+    if track.get("release_date"):
+        audio.tags.setall("TDRC", [TDRC(encoding=3, text=track["release_date"])])
+    if genres:
+        audio.tags.setall("TCON", [TCON(encoding=3, text="; ".join(genres))])
     if plain_lyrics:
         audio.tags.add(USLT(encoding=3, lang="eng", desc="", text=plain_lyrics))
 
     audio.tags.add(TXXX(encoding=3, desc="SPOTIFY_URL", text=track["spotify_url"]))
     if track.get("added_at"):
         audio.tags.add(TXXX(encoding=3, desc="SPOTIFY_ADDED_AT", text=track["added_at"]))
+    if mark_genre_checked:
+        audio.tags.add(TXXX(encoding=3, desc="GENRE_LOOKUP_DONE", text="1"))
 
-    cover_bytes = _download_cover_bytes(track.get("cover_url"))
-    if cover_bytes:
-        audio.tags.setall("APIC", [APIC(encoding=3, mime="image/jpeg", type=3, desc="Cover", data=cover_bytes)])
+    if embed_cover:
+        cover_bytes = _download_cover_bytes(track.get("cover_url"))
+        if cover_bytes:
+            audio.tags.setall("APIC", [APIC(encoding=3, mime="image/jpeg", type=3, desc="Cover", data=cover_bytes)])
 
     audio.save()
 
 
-def tag_opus(path: Path, track: dict, plain_lyrics: str | None):
+def tag_opus(path: Path, track: dict, plain_lyrics: str | None, embed_cover: bool = True,
+             genres: list[str] | None = None, mark_genre_checked: bool = False):
     audio = OggOpus(path)
     audio["title"] = track["title"]
     audio["artist"] = track["artist"]
+    audio["albumartist"] = track.get("album_artist") or track["artist"]
     audio["album"] = track["album"]
     if track["track_number"]:
         audio["tracknumber"] = str(track["track_number"])
     if track.get("isrc"):
         audio["isrc"] = track["isrc"]
+    if track.get("release_date"):
+        audio["date"] = track["release_date"]
+    if genres:
+        audio["genre"] = genres
     if plain_lyrics:
         audio["lyrics"] = plain_lyrics
     audio["spotify_url"] = track["spotify_url"]
     if track.get("added_at"):
         audio["spotify_added_at"] = track["added_at"]
+    if mark_genre_checked:
+        audio["genre_lookup_done"] = "1"
 
-    cover_bytes = _download_cover_bytes(track.get("cover_url"))
-    if cover_bytes:
-        pic = Picture()
-        pic.data = cover_bytes
-        pic.type = 3
-        pic.mime = "image/jpeg"
-        audio["metadata_block_picture"] = [base64.b64encode(pic.write()).decode("ascii")]
+    if embed_cover:
+        cover_bytes = _download_cover_bytes(track.get("cover_url"))
+        if cover_bytes:
+            pic = Picture()
+            pic.data = cover_bytes
+            pic.type = 3
+            pic.mime = "image/jpeg"
+            audio["metadata_block_picture"] = [base64.b64encode(pic.write()).decode("ascii")]
 
     audio.save()
 
 
-def tag_file(path: Path, track: dict, plain_lyrics: str | None, fmt: str):
+def tag_file(path: Path, track: dict, plain_lyrics: str | None, fmt: str, embed_cover: bool = True,
+             genres: list[str] | None = None, mark_genre_checked: bool = False):
     try:
         if fmt == "mp3":
-            tag_mp3(path, track, plain_lyrics)
+            tag_mp3(path, track, plain_lyrics, embed_cover, genres, mark_genre_checked)
         else:
-            tag_opus(path, track, plain_lyrics)
+            tag_opus(path, track, plain_lyrics, embed_cover, genres, mark_genre_checked)
     except Exception as e:
         log.error(f"Tagging fehlgeschlagen für {path}: {e}")
 
@@ -592,13 +717,10 @@ def apply_added_at_as_mtime(path: Path, added_at: str | None):
 def write_lrc_sidecar(dest_path: Path, synced_lyrics: str | None):
     if not synced_lyrics:
         return
-    lrc_path = dest_path.with_suffix(".lrc")
-    lrc_path.write_text(synced_lyrics, encoding="utf-8")
+    dest_path.with_suffix(".lrc").write_text(synced_lyrics, encoding="utf-8")
 
 
 def handle_lyrics(track: dict, dest_path: Path) -> str | None:
-    """Fetches lyrics, writes .lrc sidecar if synced, logs the outcome, and
-    returns the plain-text lyrics (for tag embedding), if any."""
     synced_lyrics, plain_lyrics = fetch_lyrics(track)
     if synced_lyrics:
         write_lrc_sidecar(dest_path, synced_lyrics)
@@ -607,6 +729,115 @@ def handle_lyrics(track: dict, dest_path: Path) -> str | None:
     else:
         log_issue(track, "LYRICS", "Keine Lyrics auf LRCLIB gefunden")
     return plain_lyrics
+
+
+# ---------------------------------------------------------------------------
+# Reorganization for the album-artist folder scheme
+# ---------------------------------------------------------------------------
+
+def reorganize_if_needed(conn: sqlite3.Connection, track: dict, existing_row: sqlite3.Row) -> Path:
+    """Moves a file to where it *should* live under the album-artist-based
+    folder scheme, if it currently lives elsewhere (e.g. downloaded before
+    this fix, or under a track-artist folder due to a featuring credit)."""
+    old_path = Path(existing_row["file_path"])
+    new_path = compute_dest_path(track)
+
+    if old_path == new_path:
+        return old_path
+    if not old_path.exists():
+        return old_path  # nothing to move; will be flagged as missing elsewhere
+
+    new_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        shutil.move(str(old_path), str(new_path))
+    except OSError as e:
+        log.error(f"Konnte Datei nicht verschieben ({old_path} -> {new_path}): {e}")
+        return old_path
+
+    old_lrc, new_lrc = old_path.with_suffix(".lrc"), new_path.with_suffix(".lrc")
+    if old_lrc.exists():
+        try:
+            shutil.move(str(old_lrc), str(new_lrc))
+        except OSError:
+            pass
+
+    update_file_path(conn, track["spotify_id"], new_path)
+    log.info(f"Song neu einsortiert (Album-Artist-Korrektur): {old_path} -> {new_path}")
+
+    old_album_dir, old_artist_dir = old_path.parent, old_path.parent.parent
+    _remove_if_empty(old_album_dir)
+    _remove_if_empty(old_artist_dir)
+
+    return new_path
+
+
+# ---------------------------------------------------------------------------
+# Metadata completeness check / backfill for already-downloaded tracks
+# ---------------------------------------------------------------------------
+
+def read_existing_tag_values(path: Path, fmt: str) -> dict:
+    try:
+        if fmt == "mp3":
+            audio = MP3(path, ID3=ID3)
+            tags = audio.tags or {}
+            def _get(key):
+                v = tags.get(key)
+                return str(v.text[0]) if v and getattr(v, "text", None) else ""
+            genre_checked = any(f.desc == "GENRE_LOOKUP_DONE" for f in tags.getall("TXXX")) if tags.getall("TXXX") else False
+            return {
+                "title": _get("TIT2"), "artist": _get("TPE1"), "album_artist": _get("TPE2"),
+                "album": _get("TALB"), "track_number": _get("TRCK"), "isrc": _get("TSRC"),
+                "date": _get("TDRC"), "genre": _get("TCON"), "genre_checked": genre_checked,
+            }
+        else:
+            audio = OggOpus(path)
+            def _get(key):
+                v = audio.get(key)
+                return v[0] if v else ""
+            return {
+                "title": _get("title"), "artist": _get("artist"), "album_artist": _get("albumartist"),
+                "album": _get("album"), "track_number": _get("tracknumber"), "isrc": _get("isrc"),
+                "date": _get("date"), "genre": _get("genre"), "genre_checked": _get("genre_lookup_done") == "1",
+            }
+    except Exception as e:
+        log.warning(f"Konnte bestehende Tags nicht lesen aus {path}: {e}")
+        return {}
+
+
+def needs_metadata_backfill(existing: dict, track: dict) -> bool:
+    checks = [
+        ("title", track.get("title")),
+        ("artist", track.get("artist")),
+        ("album_artist", track.get("album_artist")),
+        ("album", track.get("album")),
+        ("track_number", str(track.get("track_number")) if track.get("track_number") else None),
+        ("isrc", track.get("isrc")),
+        ("date", track.get("release_date")),
+    ]
+    for field, available_value in checks:
+        if available_value and not existing.get(field):
+            return True
+    if track.get("isrc") and not existing.get("genre") and not existing.get("genre_checked"):
+        return True
+    return False
+
+
+def backfill_metadata(file_path: Path, track: dict, existing: dict) -> bool:
+    if not file_path.exists():
+        log_issue(track, "BACKFILL_SKIPPED", f"Datei nicht gefunden, kann Metadaten nicht auffrischen: {file_path}")
+        return False
+    fmt = "mp3" if file_path.suffix.lower() == ".mp3" else "opus" if file_path.suffix.lower() == ".opus" else None
+    if fmt is None:
+        return False
+
+    genres, mark_checked = None, False
+    if track.get("isrc") and not existing.get("genre") and not existing.get("genre_checked"):
+        genres = get_genres_for_track(track)
+        mark_checked = True
+
+    tag_file(file_path, track, plain_lyrics=None, fmt=fmt, embed_cover=False,
+              genres=genres, mark_genre_checked=mark_checked)
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -635,26 +866,45 @@ def main():
     conn = init_db(OUTPUT_DIR)
     setup_issues_logger(OUTPUT_DIR)
 
-    processed = skipped = failed = overridden = 0
+    processed = skipped = failed = overridden = invalid = backfilled = moved = 0
     start_time = time.monotonic()
     pbar = tqdm(total=total, unit="song", desc="Verarbeite", dynamic_ncols=True)
 
     for track in tracks:
+        if not track["title"].strip() or not track["artist"].strip():
+            log_issue(track, "INVALID_METADATA",
+                      "Spotify lieferte leeren Titel/Artist (evtl. regional gesperrt oder aus dem Katalog entfernt) "
+                      "-- Link manuell prüfen")
+            invalid += 1
+            pbar.update(1)
+            continue
+
+        is_override_target = track["spotify_id"] in overrides
         existing = already_in_repo(conn, track["spotify_id"], track.get("isrc"))
-        if existing:
+
+        if existing and not is_override_target:
+            file_path = reorganize_if_needed(conn, track, existing)
+            if file_path != Path(existing["file_path"]):
+                moved += 1
+            existing_tags = read_existing_tag_values(file_path, file_path.suffix.lstrip(".")) if file_path.exists() else {}
+            if existing_tags and needs_metadata_backfill(existing_tags, track):
+                if backfill_metadata(file_path, track, existing_tags):
+                    backfilled += 1
+                    pbar.set_postfix_str(f"Metadaten aktualisiert: {track['title'][:30]}")
+            else:
+                pbar.set_postfix_str(f"übersprungen: {track['title'][:30]}")
             skipped += 1
-            pbar.set_postfix_str(f"übersprungen: {track['title'][:30]}")
             pbar.update(1)
             continue
 
         try:
-            artist_dir = OUTPUT_DIR / sanitize(track["artist"])
-            album_dir = artist_dir / sanitize(track["album"])
+            dest_path = compute_dest_path(track)
+            album_dir = dest_path.parent
             album_dir.mkdir(parents=True, exist_ok=True)
 
-            base_name = (f"{track['track_number']:02d} - {sanitize(track['title'])}"
-                         if track["track_number"] else sanitize(track["title"]))
-            dest_path = album_dir / f"{base_name}.{OUTPUT_FORMAT}"
+            if existing and is_override_target:
+                log.info(f"Override für bereits vorhandenen Song '{track['title']}' -- lade neu herunter.")
+                remove_existing_files(dest_path)
 
             youtube_url, confidence, resolved_via = resolve_youtube_url(track, overrides)
             if not youtube_url:
@@ -665,8 +915,7 @@ def main():
             if resolved_via == "override":
                 overridden += 1
             elif confidence < MATCH_CONFIDENCE_WARN_THRESHOLD:
-                log_issue(track, "MATCH_UNCERTAIN",
-                          f"Konfidenz nur {confidence:.2f} -> bitte prüfen: {youtube_url}")
+                log_issue(track, "MATCH_UNCERTAIN", f"Konfidenz nur {confidence:.2f} -> bitte prüfen: {youtube_url}")
 
             if not download_audio(youtube_url, dest_path, OUTPUT_FORMAT):
                 log_issue(track, "DOWNLOAD", f"yt-dlp Download fehlgeschlagen ({youtube_url}, via {resolved_via})")
@@ -675,7 +924,9 @@ def main():
                 continue
 
             plain_lyrics = handle_lyrics(track, dest_path)
-            tag_file(dest_path, track, plain_lyrics, OUTPUT_FORMAT)
+            genres = get_genres_for_track(track) if track.get("isrc") else []
+            tag_file(dest_path, track, plain_lyrics, OUTPUT_FORMAT,
+                      genres=genres, mark_genre_checked=bool(track.get("isrc")))
             apply_added_at_as_mtime(dest_path, track.get("added_at"))
             ensure_album_cover(album_dir, track.get("cover_url"))
             record_track(conn, track, dest_path, youtube_url, resolved_via, source_label)
@@ -686,16 +937,18 @@ def main():
             log_issue(track, "ERROR", str(e))
             failed += 1
 
-        done = processed + skipped + failed
+        done = processed + skipped + failed + invalid
         rate = (time.monotonic() - start_time) / done if done else 0
         eta_min = rate * (total - done) / 60
-        pbar.set_postfix_str(f"OK:{processed} Skip:{skipped} Fail:{failed} ETA:{eta_min:.1f}min")
+        pbar.set_postfix_str(f"OK:{processed} Skip:{skipped} Fail:{failed} Invalid:{invalid} ETA:{eta_min:.1f}min")
         pbar.update(1)
 
     pbar.close()
     conn.close()
-    log.info(f"Fertig. Neu: {processed} (davon {overridden} via Override), übersprungen: {skipped}, "
-              f"fehlgeschlagen: {failed} (Details in {OUTPUT_DIR / ISSUES_LOG_NAME}).")
+    log.info(f"Fertig. Neu: {processed} (davon {overridden} via Override), übersprungen: {skipped} "
+              f"(davon {backfilled} mit Metadaten-Backfill, {moved} neu einsortiert), "
+              f"fehlgeschlagen: {failed}, ungültige Metadaten: {invalid} "
+              f"(Details in {OUTPUT_DIR / ISSUES_LOG_NAME}).")
 
 
 if __name__ == "__main__":
