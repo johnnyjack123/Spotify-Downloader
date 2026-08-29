@@ -2,8 +2,17 @@
 """
 Separate, minimal script: recursively scans a folder for audio files and
 stars them as favorites on Navidrome (Subsonic API). No file is copied or
-moved -- starring is a server-side annotation only, so a song can be a
-favorite AND part of its album without any duplication.
+moved -- starring is a server-side annotation only.
+
+Ordering matters here: Navidrome records a "dateLoved" timestamp for each
+song at the moment the star request is received, and that's what most
+clients (Feishin, Symfonium, Tempo) use to sort a "Favorites" view by
+"recently starred". Since spotify_to_feishin.py already sets each file's
+mtime to the real Spotify "added_at" date, this script stars files in
+mtime order (oldest first) -- so the resulting dateLoved order on
+Navidrome matches your original Spotify Liked Songs order. In your
+client, make sure the Favorites/Starred view is sorted by "date starred"
+(not alphabetically) to see this.
 
 Usage:
     python star_favorites.py                  # uses OUTPUT_DIR from .env
@@ -18,6 +27,7 @@ Usage:
 
 import os
 import sys
+import time
 import hashlib
 import logging
 from pathlib import Path
@@ -123,8 +133,13 @@ def main():
         log.warning(f"Keine Audiodateien in {root} gefunden.")
         return
 
+    # Sort by mtime (spotify_to_feishin.py sets this to the real Spotify
+    # "added_at" date) so the resulting Navidrome "dateLoved" order matches
+    # your original Liked Songs order -- oldest liked first.
+    audio_files.sort(key=lambda p: p.stat().st_mtime)
+
     starred, not_found, failed = 0, 0, 0
-    for path in tqdm(audio_files, desc="Starre Favoriten", unit="song"):
+    for path in tqdm(audio_files, desc="Starre Favoriten (in Spotify-Reihenfolge)", unit="song"):
         tags = read_tags(path)
         if not tags:
             failed += 1
@@ -139,6 +154,7 @@ def main():
             starred += 1
         else:
             failed += 1
+        time.sleep(0.05)  # ensure strictly increasing dateLoved timestamps
 
     log.info(f"Fertig. Als Favorit markiert: {starred}, nicht gefunden: {not_found}, fehlgeschlagen: {failed}.")
 
