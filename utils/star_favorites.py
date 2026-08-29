@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """
-Separate, minimal script: recursively scans a folder for .mp3 files and
+Separate, minimal script: recursively scans a folder for audio files and
 stars them as favorites on Navidrome (Subsonic API). No file is copied or
 moved -- starring is a server-side annotation only, so a song can be a
 favorite AND part of its album without any duplication.
 
 Usage:
-    python star_favorites.py /path/to/music_library
+    python star_favorites.py                  # uses OUTPUT_DIR from .env
+    python star_favorites.py /pfad/zum/ordner  # explicit override
 
 .env (same directory):
+  OUTPUT_DIR=./music_library     # shared with spotify_to_feishin.py
   NAVIDROME_URL=http://192.168.1.10:4533
   NAVIDROME_USER=youruser
   NAVIDROME_PASS=yourpass
@@ -21,8 +23,7 @@ import logging
 from pathlib import Path
 
 import requests
-from mutagen.mp3 import MP3
-from mutagen.id3 import ID3
+from mutagen import File as MutagenFile
 from dotenv import load_dotenv
 from tqdm import tqdm
 
@@ -31,12 +32,14 @@ log = logging.getLogger("star_favorites")
 
 load_dotenv()
 
+OUTPUT_DIR_DEFAULT = os.getenv("OUTPUT_DIR", "").strip()
 NAVIDROME_URL = os.getenv("NAVIDROME_URL", "").strip().rstrip("/")
 NAVIDROME_USER = os.getenv("NAVIDROME_USER", "").strip()
 NAVIDROME_PASS = os.getenv("NAVIDROME_PASS", "").strip()
 
 SUBSONIC_CLIENT = "star-favorites-script"
 SUBSONIC_VERSION = "1.16.1"
+AUDIO_EXTENSIONS = ("*.mp3", "*.opus", "*.ogg", "*.flac", "*.m4a")
 
 
 def _auth_params() -> dict:
@@ -47,9 +50,12 @@ def _auth_params() -> dict:
 
 def read_tags(path: Path) -> tuple[str, str] | None:
     try:
-        audio = MP3(path, ID3=ID3)
-        title = str(audio.tags.get("TIT2", [""])[0]) if audio.tags.get("TIT2") else path.stem
-        artist = str(audio.tags.get("TPE1", [""])[0]) if audio.tags.get("TPE1") else None
+        audio = MutagenFile(path, easy=True)
+        if audio is None or not audio.tags:
+            log.warning(f"Keine Tags lesbar in {path}, überspringe.")
+            return None
+        title = (audio.tags.get("title") or [path.stem])[0]
+        artist = (audio.tags.get("artist") or [None])[0]
         if not artist:
             log.warning(f"Keine Artist-Metadaten in {path}, überspringe.")
             return None
@@ -73,7 +79,6 @@ def find_song_id(title: str, artist: str) -> str | None:
     for s in songs:
         if s.get("title") == title and s.get("artist") == artist:
             return s["id"]
-    # Fallback: title-only match if exactly one candidate
     title_matches = [s for s in songs if s.get("title") == title]
     if len(title_matches) == 1:
         return title_matches[0]["id"]
@@ -97,22 +102,29 @@ def main():
         log.error("NAVIDROME_URL / NAVIDROME_USER / NAVIDROME_PASS fehlen in der .env-Datei.")
         sys.exit(1)
 
-    if len(sys.argv) < 2:
-        log.error("Bitte einen Ordnerpfad angeben: python star_favorites.py /pfad/zum/ordner")
+    if len(sys.argv) >= 2:
+        root = Path(sys.argv[1])
+    elif OUTPUT_DIR_DEFAULT:
+        root = Path(OUTPUT_DIR_DEFAULT)
+        log.info(f"Kein Pfad angegeben, nutze OUTPUT_DIR aus der .env: {root}")
+    else:
+        log.error("Kein Ordnerpfad angegeben und OUTPUT_DIR ist auch nicht in der .env gesetzt.")
         sys.exit(1)
 
-    root = Path(sys.argv[1])
     if not root.is_dir():
         log.error(f"Ordner nicht gefunden: {root}")
         sys.exit(1)
 
-    mp3_files = list(root.rglob("*.mp3"))
-    if not mp3_files:
-        log.warning(f"Keine .mp3-Dateien in {root} gefunden.")
+    audio_files = []
+    for pattern in AUDIO_EXTENSIONS:
+        audio_files.extend(root.rglob(pattern))
+
+    if not audio_files:
+        log.warning(f"Keine Audiodateien in {root} gefunden.")
         return
 
     starred, not_found, failed = 0, 0, 0
-    for path in tqdm(mp3_files, desc="Starre Favoriten", unit="song"):
+    for path in tqdm(audio_files, desc="Starre Favoriten", unit="song"):
         tags = read_tags(path)
         if not tags:
             failed += 1
