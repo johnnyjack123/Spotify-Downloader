@@ -1,146 +1,191 @@
-# Spotify → YouTube Music → Navidrome Pipeline
+<div align="center">
 
-Zwei unabhängige Skripte:
+# Spotify to Local Music Library
 
-- **`spotify_to_feishin.py`** — lädt eine Spotify-Playlist, deine Liked Songs oder ein komplettes Album, sucht im **offiziellen YouTube-Music-Katalog** (via `ytmusicapi`) das passende Lied, wählt per Titel-/Artist-/Längenabgleich den zuverlässigsten Treffer, lädt das Audio per `yt-dlp` herunter (MP3 oder Opus), taggt die Datei vollständig (Titel, Artist, Album, Tracknummer, Cover, ISRC), holt Lyrics von LRCLIB und organisiert alles in `Artist/Album/`-Ordnern. Eine SQLite-Datenbank (`library.db`) im Zielordner verhindert doppelte Downloads.
-- **`star_favorites.py`** — durchsucht rekursiv einen Ordner nach Audiodateien und markiert sie in Navidrome als Favorit (Subsonic-API), komplett getrennt vom Download-Vorgang.
+**[🇩🇪 Deutsch](#deutsch) | [🇬🇧 English](#english)**
 
-## Wichtiger Hinweis: song.link/Odesli-API ist tot
+</div>
 
-Linktree hat die öffentliche Odesli/song.link-API (`v1-alpha.1`) am **1. August 2026 abgeschaltet** — automatisierte Anfragen bekommen seitdem Fehler statt Ergebnisse. Die song.link-**Webseite** funktioniert für manuelle, einzelne Abfragen weiterhin (du kannst den in jeder Datei gespeicherten Spotify-Link jederzeit selbst dort einfügen), aber es gibt keine API mehr für Automatisierung.
+---
 
-## Wie das Skript den richtigen Song findet
+<a id="deutsch"></a>
 
-Statt einer reinen YouTube-Textsuche durchsucht das Skript über `ytmusicapi` gezielt den **kuratierten offiziellen "Songs"-Katalog** von YouTube Music — dieselben lizenzierten Aufnahmen, die auch an Spotify verteilt werden. Aus mehreren Kandidaten wird der beste per Score aus Titel-Ähnlichkeit, Interpreten-Ähnlichkeit und Songlängen-Abgleich (gegen die echte Spotify-Laufzeit) ausgewählt. Liegt die Konfidenz des besten Treffers unter 60 %, wird das explizit im Log vermerkt (`[MATCH_UNCERTAIN]`).
+## Deutsch
 
-## Manuelle Overrides ("Hosts-Datei" für Songs)
+Lädt Songs aus einer Spotify-Playlist, deinen "Liked Songs" oder einem ganzen Album als lokale Audiodateien herunter, versehen mit vollständigen Metadaten (Titel, Interpret, Album, Tracknummer, Erscheinungsjahr, Genre, Cover) und Lyrics. Alles wird ordentlich in Ordnern nach Interpret/Album sortiert.
 
-Manche Songs findet die automatische Suche nicht oder nur unzuverlässig — dafür gibt es `<OUTPUT_DIR>/overrides.txt` (Beispiel in `overrides.example.txt`). Format wie eine Hosts-Datei, eine Zeile pro Song:
+### Features
 
-```
-# Spotify-Link/URI                                          YouTube-Link
-https://open.spotify.com/track/4NuKN3QLEypxlFUoxC2kmZ       https://www.youtube.com/watch?v=abc123
-spotify:track:5f8N3xyzABC123def456                          https://youtu.be/xyz789
-```
+- Playlists, Liked Songs oder ganze Alben herunterladen
+- Automatische Metadaten: Titel, Interpret, Album, Albumkünstler, Tracknummer, Erscheinungsjahr, ISRC
+- Genre-Anreicherung über MusicBrainz
+- Synchronisierte Lyrics (als `.lrc`-Datei) über LRCLIB
+- Cover-Art pro Album
+- Ausgabeformat MP3 oder Opus
+- Verhindert doppelte Downloads (auch über mehrere Playlists hinweg)
+- Manuelle Korrekturen über eine einfache Textdatei möglich
+- Räumt und aktualisiert bestehende Dateien automatisch auf, wenn sich Metadaten ändern
 
-Mit `--use-overrides` (optional ein eigener Pfad statt des Standardpfads) prüft das Skript für jeden Track zuerst, ob ein Override existiert, und lädt in dem Fall **genau diesen YouTube-Link** herunter — ganz ohne YT-Music-Suche. Die Metadaten (Titel, Interpret, Album, Cover, ISRC) kommen dabei trotzdem ausschließlich von der Spotify-API, exakt wie bei automatisch gefundenen Songs, weil YouTube-Metadaten (Videotitel etc.) dafür nicht zuverlässig genug sind.
+### Voraussetzungen
 
-Typischer Workflow:
+- Python 3.11 oder neuer
+- [ffmpeg](https://ffmpeg.org/download.html) installiert und im `PATH`
+- Ein Spotify-Developer-Account mit einer eigenen App ([developer.spotify.com](https://developer.spotify.com/dashboard))
 
-1. Normalen Lauf starten, in `issues.log` nachsehen, welche Songs fehlgeschlagen sind.
-2. Für diese Songs manuell den passenden YouTube-Link suchen und in `overrides.txt` eintragen.
-3. Denselben Befehl erneut mit `--use-overrides` ausführen — nur die noch fehlenden Songs (die ja nie in `library.db` gelandet sind) werden erneut versucht und finden dann den Override.
-
-## Voraussetzungen
-
-### Python-Abhängigkeiten
+### Installation
 
 ```bash
+git clone https://github.com/johnnyjack123/Spotify-Downloader
+mv .env.example .env
 python -m venv venv
 source venv/bin/activate      # Windows: venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-### ffmpeg
+### Einrichtung
 
-`yt-dlp` braucht `ffmpeg`, um das heruntergeladene Audio in MP3/Opus umzuwandeln. Das ist reine Audio-Transkodierung (kein Video) und läuft auch auf einem Raspberry Pi 3/4/5 problemlos in wenigen Sekunden pro Song.
+`.env`-Datei bearbeiten:
 
-- **Arch/CachyOS**: `sudo pacman -S ffmpeg`
-- **Ubuntu/Debian/Raspberry Pi OS**: `sudo apt install ffmpeg`
-- **Windows**: `winget install ffmpeg` oder Binary von [ffmpeg.org](https://ffmpeg.org/download.html) laden und zum `PATH` hinzufügen
+| Variable | Beschreibung |
+|---|---|
+| `SPOTIFY_CLIENT_ID` / `SPOTIFY_CLIENT_SECRET` | Zugangsdaten deiner Spotify-App |
+| `SPOTIFY_REDIRECT_URI` | Muss exakt mit der in der Spotify-App eingetragenen Redirect-URI übereinstimmen |
+| `OUTPUT_DIR` | Zielordner für die Musikbibliothek |
+| `OUTPUT_FORMAT` | `mp3` oder `opus` |
+| `PLAYLIST_NAME` | *(optional)* Standard-Playlist, falls kein Kommandozeilen-Argument angegeben wird |
 
-Prüfen, ob es funktioniert:
+Beim ersten Start öffnet sich ein Login-Link für Spotify im Terminal. Öffne ihn in einem Browser (auf beliebigem Gerät), logge dich ein und kopiere die resultierende URL zurück ins Terminal, falls danach gefragt wird.
 
-```bash
-ffmpeg -version
-```
-
-### yt-dlp aktuell halten
-
-YouTube ändert öfter interne APIs, wodurch ältere `yt-dlp`-Versionen kaputtgehen. Regelmäßig updaten:
+### Nutzung
 
 ```bash
-pip install -U yt-dlp
+# Eine bestimmte Playlist
+python main.py --playlist "Roadtrip Mix"
+
+# Die eigenen Liked Songs
+python main.py --playlist "Liked Songs"
+
+# Ein ganzes Album (Name oder Spotify-Link)
+python main.py --album "The Dark Side of the Moon"
+python main.py --album "https://open.spotify.com/album/..."
 ```
 
-Falls Downloads plötzlich mit Fehlern wie "Sign in to confirm you're not a bot" fehlschlagen, hilft meist ein `yt-dlp`-Update oder das Hinterlegen von Cookies (`--cookies-from-browser`), das aktuell nicht im Skript enthalten ist.
+### Fehlende Songs manuell nachtragen
 
-## .env-Datei
+Findet das Skript für einen Song keinen passenden Treffer, kannst du ihn manuell zuordnen. Lege dafür eine `overrides.txt` im `OUTPUT_DIR` an:
 
-Beide Skripte lesen Konfiguration aus einer `.env`-Datei im selben Verzeichnis. Diese Datei ist **nicht Teil des Repos** und sollte nie committed werden.
-
-```env
-# spotify_to_feishin.py
-SPOTIFY_CLIENT_ID=
-SPOTIFY_CLIENT_SECRET=
-SPOTIFY_REDIRECT_URI=http://127.0.0.1:8080/callback
-PLAYLIST_NAME=Lieblingssongs
-OUTPUT_DIR=./music_library
-OUTPUT_FORMAT=mp3
-
-# star_favorites.py
-NAVIDROME_URL=
-NAVIDROME_USER=
-NAVIDROME_PASS=
+```
+# Spotify-Link                                          YouTube-Link
+https://open.spotify.com/track/xxxxxxxxxxxxxxxxxxxxxx    https://www.youtube.com/watch?v=xxxxxxxxxxx
 ```
 
-- `PLAYLIST_NAME` ist nur ein Fallback-Standardwert für Läufe ohne `--playlist`/`--album`-Flag.
-- `OUTPUT_FORMAT`: `mp3` (universell kompatibel) oder `opus` (ca. halb so groß bei vergleichbarer Qualität, von Symfonium/Tempo/Feishin unterstützt).
-
-## Ausführung
+Und starte den Lauf mit zusätzlichem Flag:
 
 ```bash
-# Playlist aus PLAYLIST_NAME (.env)
-python spotify_to_feishin.py
-
-# Eine bestimmte Playlist oder "Liked Songs"
-python spotify_to_feishin.py --playlist "Roadtrip Mix"
-python spotify_to_feishin.py --playlist "Liked Songs"
-
-# Ein komplettes Album (Name oder Spotify-Link/URI)
-python spotify_to_feishin.py --album "The Dark Side of the Moon"
-python spotify_to_feishin.py --album "https://open.spotify.com/album/xyz..."
-
-# Mit manuellen Overrides für zuvor fehlgeschlagene Songs
-python spotify_to_feishin.py --playlist "Liked Songs" --use-overrides
-
-# Favoriten separat markieren
-python star_favorites.py ./music_library
+python main.py --playlist "Liked Songs" --use-overrides
 ```
 
-`--playlist` und `--album` schließen sich gegenseitig aus.
+### Favoriten auf einem Musikserver markieren (optional)
 
-## Spotify-Login auf einem headless Gerät (z. B. Raspberry Pi)
+Betreibst du einen eigenen Subsonic-kompatiblen Musikserver (z. B. Navidrome), kann `star_favorites.py` deine heruntergeladenen Liked Songs dort automatisch als Favoriten markieren:
 
-Der Login versucht auf einem Server ohne Display keinen Browser mehr zu öffnen (`open_browser=False`), sondern gibt die Login-URL im Terminal aus. Öffne diese URL auf einem beliebigen Gerät mit Browser, logge dich ein, und kopiere die resultierende Redirect-URL zurück ins Terminal, wenn danach gefragt wird. Alternativ: einmal auf einem Gerät mit Browser einloggen und die entstandene `.spotify_cache`-Datei per `scp` auf den Pi kopieren — der Token ist nicht an eine Maschine gebunden.
-
-## Albumreihenfolge in Navidrome
-
-Navidrome sortiert Tracks innerhalb eines Albums nach dem `tracknumber`-Tag (bei Mehrfach-CDs zusätzlich nach `discnumber`), nicht nach Dateiname oder Download-Reihenfolge. Das Skript schreibt diesen Tag korrekt, die Reihenfolge stimmt also automatisch nach dem Scan.
-
-## Lyrics
-
-Für jeden Song wird automatisch bei [LRCLIB](https://lrclib.net) (kostenlos, kein API-Key) nach Lyrics gesucht. Sind synchronisierte Lyrics vorhanden, landen sie als `Song.lrc` neben der Audiodatei — Navidrome ab Version 0.63 zeigt diese direkt an. Gibt es nur unsynchronisierten Text, wird er als Tag eingebettet, aber es entsteht keine `.lrc`-Datei. Beide Fälle (keine Lyrics / nur unsynchronisiert) werden ins Log geschrieben.
-
-## Fortschrittsanzeige
-
-Während des Laufs zeigt eine Fortschrittsleiste (via `tqdm`) live an, wie viele Songs erledigt, übersprungen oder fehlgeschlagen sind, plus eine laufend aktualisierte ETA-Schätzung in Minuten.
-
-## Logdatei: issues.log
-
-Alles, was nicht rund läuft, landet mit Zeitstempel, Interpret, Titel, Spotify-Link und Kategorie in `<OUTPUT_DIR>/issues.log`:
-
-- `[DOWNLOAD]` — kein Treffer im YT-Music-Katalog gefunden (auch kein Override) oder yt-dlp-Fehler
-- `[MATCH_UNCERTAIN]` — automatischer Treffer mit niedriger Konfidenz (< 60 %) — lohnt sich, manuell zu prüfen oder per Override zu korrigieren
-- `[LYRICS]` — keine Lyrics gefunden, oder nur unsynchronisierte vorhanden
-- `[ERROR]` — unerwarteter Fehler während der Verarbeitung
-
-## Empfohlene Navidrome-Konfiguration
-
-Damit "Zuletzt hinzugefügt" das tatsächliche Spotify-Hinzufügedatum statt des Download-Datums widerspiegelt, in der `navidrome.toml`:
-
-```toml
-RecentlyAddedByModTime = true
+```bash
+cd utils
+mv .env.example .env # Einträge in .env bearbeiten
+python star_favorites.py /pfad/zur/musikbibliothek
 ```
 
-Das Skript setzt die Datei-mtime bereits automatisch auf den echten `added_at`-Zeitstempel aus Spotify (bei Alben gibt es kein persönliches Hinzufügedatum, daher bleibt die mtime dort unverändert).
+Das ist komplett optional und unabhängig vom eigentlichen Download — ohne diese Variablen läuft `main.py` ganz normal weiter, nur ohne automatisches Markieren.
+Sind Nutzerdaten für z.B. Navidrome hinterlegt, werden heruntergeladenen Songs aus "Liked Songs" automatisch favorisiert.
+
+---
+
+<a id="english"></a>
+
+## English
+
+Downloads songs from a Spotify playlist, your Liked Songs, or an entire album as local audio files, complete with full metadata (title, artist, album, track number, release year, genre, cover art) and lyrics. Everything is organized neatly into artist/album folders.
+
+### Features
+
+- Download playlists, Liked Songs, or entire albums
+- Automatic metadata: title, artist, album, album artist, track number, release year, ISRC
+- Genre enrichment via MusicBrainz
+- Synced lyrics (as `.lrc` files) via LRCLIB
+- Cover art per album
+- Output as MP3 or Opus
+- Prevents duplicate downloads (even across multiple playlists)
+- Manual corrections possible via a simple text file
+- Automatically reorganizes and updates existing files when metadata changes
+
+### Requirements
+
+- Python 3.11 or newer
+- [ffmpeg](https://ffmpeg.org/download.html) installed and on your `PATH`
+- A Spotify Developer account with your own app ([developer.spotify.com](https://developer.spotify.com/dashboard))
+
+### Installation
+
+```bash
+git clone https://github.com/johnnyjack123/Spotify-Downloader
+mv .env.example .env
+python -m venv venv
+source venv/bin/activate      # Windows: venv\Scripts\activate
+pip install -r requirements.txt
+```
+
+### Setup
+
+Edit `.env`-file:
+
+| Variable | Description |
+|---|---|
+| `SPOTIFY_CLIENT_ID` / `SPOTIFY_CLIENT_SECRET` | Credentials from your Spotify app |
+| `SPOTIFY_REDIRECT_URI` | Must exactly match the redirect URI configured in your Spotify app |
+| `OUTPUT_DIR` | Destination folder for your music library |
+| `OUTPUT_FORMAT` | `mp3` or `opus` |
+| `PLAYLIST_NAME` | *(optional)* Default playlist used when no command-line argument is given |
+
+On first run, a Spotify login link is printed in the terminal. Open it in a browser (on any device), log in, and paste the resulting URL back into the terminal if prompted.
+
+### Usage
+
+```bash
+# A specific playlist
+python main.py --playlist "Roadtrip Mix"
+
+# Your own Liked Songs
+python main.py --playlist "Liked Songs"
+
+# An entire album (name or Spotify link)
+python main.py --album "The Dark Side of the Moon"
+python main.py --album "https://open.spotify.com/album/..."
+```
+
+### Manually fixing missing songs
+
+If the script can't find a good match for a song, you can map it manually. Create an `overrides.txt` in your `OUTPUT_DIR`:
+
+```
+# Spotify link                                            YouTube link
+https://open.spotify.com/track/xxxxxxxxxxxxxxxxxxxxxx      https://www.youtube.com/watch?v=xxxxxxxxxxx
+```
+
+Then run with the extra flag:
+
+```bash
+python main.py --playlist "Liked Songs" --use-overrides
+```
+
+### Starring favorites on a music server (optional)
+
+If you run your own Subsonic-compatible music server (e.g. Navidrome), `star_favorites.py` can automatically mark your downloaded Liked Songs as favorites there:
+
+```bash
+cd utils
+mv .env.example .env # Edit entries in .env
+python star_favorites.py /path/to/musiclibrary
+```
+
+This is entirely optional and independent of the main download process — without these variables, `main.py` runs normally, just without automatic starring.
+If user data is stored for e.g. Navidrome, downloaded songs from "Liked Songs" will be automatically favorited.
